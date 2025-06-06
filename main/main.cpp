@@ -269,6 +269,14 @@ void app_main(void) {
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+    size_t largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+
+    ESP_LOGI(TAG, "Free heap: %u bytes", (unsigned)free_heap);
+    ESP_LOGI(TAG, "Minimum ever free heap: %u bytes", (unsigned)min_free_heap);
+    ESP_LOGI(TAG, "Largest free block: %u bytes", (unsigned)largest_free_block);
+
     client = esp_websocket_client_init(&websocket_cfg);
 
     esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
@@ -277,7 +285,15 @@ void app_main(void) {
 
     while (1) {
         // O evento de dados é tratado na callback, aqui só mantemos a task viva
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+        free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+        min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+        largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+
+        ESP_LOGI(TAG, "Free heap: %u bytes", (unsigned)free_heap);
+        ESP_LOGI(TAG, "Minimum ever free heap: %u bytes", (unsigned)min_free_heap);
+        ESP_LOGI(TAG, "Largest free block: %u bytes", (unsigned)largest_free_block);
     }
 
     // Nunca alcançado, mas caso queira parar e limpar:
