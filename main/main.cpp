@@ -4,6 +4,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mbedtls/md.h"
 #include "nvs_flash.h"
 #include <ArduinoJson.h>
 #include <string>
@@ -138,6 +139,106 @@ JsonDocument deserializeMpackToJson(mpack_node_t root) {
     return doc; // Returna o JsonDocument.
 }
 
+void sendWebSockMessage(JsonDocument doc) {
+    uint16_t strSize = measureJson(doc); // Pega o tamanho do JSON em string para garantir que vai caber no buffer do MessagePack
+    // uint8_t msgpackBuf[256] __attribute__((aligned(4)));
+    uint8_t *msgpackBuf = new uint8_t[strSize];
+    mpack_writer_t writer;
+    mpack_writer_init(&writer, (char *)msgpackBuf, strSize);
+
+    serializeJsonToMpack(&writer, doc.as<JsonVariant>());
+
+    size_t used = mpack_writer_buffer_used(&writer);
+
+    if (!mpack_writer_destroy(&writer)) {
+        int err = esp_websocket_client_send_bin(client, (const char *)msgpackBuf, used, portMAX_DELAY);
+        if (err > 0) {
+            ESP_LOGI(TAG, "Sent MessagePack response");
+        }
+        else {
+            ESP_LOGE(TAG, "Failed to send WebSocket message");
+        }
+    }
+    else {
+        ESP_LOGE(TAG, "Failed to serialize MessagePack");
+        mpack_error_t err = mpack_writer_error(&writer);
+        ESP_LOGE(TAG, "MPack writer error: %d", err);
+    }
+
+    delete[] msgpackBuf;
+}
+
+/**
+ * @brief Calcula a contrachave (resposta HMAC-SHA256).
+ * * @param desafio A string de desafio recebida do servidor.
+ * @param segredo O segredo compartilhado do dispositivo.
+ * @param saida_buffer O buffer onde a resposta hexadecimal será escrita.
+ * @param saida_buffer_len O tamanho do buffer de saída.
+ * @return esp_err_t ESP_OK em sucesso, ESP_FAIL em erro.
+ */
+esp_err_t calculate_key(const char *desafio, const char *segredo, char *saida_buffer, size_t saida_buffer_len) {
+
+    // O hash SHA-256 tem 32 bytes de saída binária.
+    // Em hexadecimal, são 64 caracteres + 1 para o terminador nulo.
+    if (saida_buffer_len < 65) {
+        ESP_LOGE(TAG, "Buffer de saída muito pequeno!");
+        return ESP_FAIL;
+    }
+
+    mbedtls_md_context_t ctx;
+    const mbedtls_md_info_t *md_info;
+    unsigned char hmac_resultado[32]; // Saída binária do SHA-256
+
+    // 1. Inicializa o contexto mbed TLS
+    mbedtls_md_init(&ctx);
+    md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+
+    if (md_info == NULL) {
+        ESP_LOGE(TAG, "Falha ao obter informações do mbedtls_md_info_from_type");
+        mbedtls_md_free(&ctx);
+        return ESP_FAIL;
+    }
+
+    // 2. Configura o contexto para o modo HMAC com o segredo
+    if (mbedtls_md_setup(&ctx, md_info, 1) != 0) { // 1 = hmac mode
+        ESP_LOGE(TAG, "Falha no mbedtls_md_setup");
+        mbedtls_md_free(&ctx);
+        return ESP_FAIL;
+    }
+
+    if (mbedtls_md_hmac_starts(&ctx, (const unsigned char *)segredo, strlen(segredo)) != 0) {
+        ESP_LOGE(TAG, "Falha no mbedtls_md_hmac_starts");
+        mbedtls_md_free(&ctx);
+        return ESP_FAIL;
+    }
+
+    // 3. Alimenta o desafio no cálculo do HMAC
+    if (mbedtls_md_hmac_update(&ctx, (const unsigned char *)desafio, strlen(desafio)) != 0) {
+        ESP_LOGE(TAG, "Falha no mbedtls_md_hmac_update");
+        mbedtls_md_free(&ctx);
+        return ESP_FAIL;
+    }
+
+    // 4. Finaliza o cálculo e obtém o resultado binário
+    if (mbedtls_md_hmac_finish(&ctx, hmac_resultado) != 0) {
+        ESP_LOGE(TAG, "Falha no mbedtls_md_hmac_finish");
+        mbedtls_md_free(&ctx);
+        return ESP_FAIL;
+    }
+
+    // Libera o contexto
+    mbedtls_md_free(&ctx);
+
+    // 5. Converte o resultado binário para uma string hexadecimal
+    for (int i = 0; i < sizeof(hmac_resultado); i++) {
+        sprintf(saida_buffer + (i * 2), "%02x", hmac_resultado[i]);
+    }
+    saida_buffer[64] = '\0'; // Adiciona o terminador nulo
+
+    ESP_LOGI(TAG, "Cálculo da contrachave concluído com sucesso.");
+    return ESP_OK;
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     switch (event_id) {
     case WIFI_EVENT_STA_START:
@@ -190,6 +291,9 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         break;
 
     case WEBSOCKET_EVENT_DATA: {
+        if (data->op_code == 0x9 || data->op_code == 0xA) {
+            return; // Dar Return pq é PING ou PONG
+        }
         // ESP_LOGI(TAG, "Received data: %.*s", data->data_len, (char *)data->data_ptr);
         JsonDocument rcvData;
         mpack_tree_t tree;
@@ -199,9 +303,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
         rcvData = deserializeMpackToJson(root);
         mpack_tree_destroy(&tree);
-        std::string jsonString;
-        serializeJson(rcvData, jsonString);
-        ESP_LOGI(TAG, "Received data: %s", jsonString.c_str());
+        ESP_LOGI(TAG, "Received data: %s", rcvData.as<std::string>().c_str());
 
         if (rcvData["type"].as<std::string>() == "greeting") {
             ESP_LOGI(TAG, "Greeting detected, preparing JSON...");
@@ -214,28 +316,19 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             doc["content"]["name"] = "Brise15";
             doc["content"]["kind"] = 0;
 
-            static uint8_t msgpack_buf[256] __attribute__((aligned(4)));
-            mpack_writer_t writer;
-            mpack_writer_init(&writer, (char *)msgpack_buf, sizeof(msgpack_buf));
+            char calcKey[65]; // 64 chars para hex + 1 para '\0'
+            calculate_key(rcvData["content"][1].as<const char *>(), "100015-ChaveSecreta", calcKey, sizeof(calcKey));
+            doc["content"]["key"] = std::string(calcKey);
 
-            serializeJsonToMpack(&writer, doc.as<JsonVariant>());
+            sendWebSockMessage(doc);
+        }
+        else if (rcvData["type"].as<std::string>() == "greeting-reply") {
+            JsonDocument doc;
+            doc["type"] = "sub";
 
-            size_t used = mpack_writer_buffer_used(&writer);
+            doc["content"].to<JsonObject>();
 
-            if (!mpack_writer_destroy(&writer)) {
-                int err = esp_websocket_client_send_bin(client, (const char *)msgpack_buf, used, portMAX_DELAY);
-                if (err > 0) {
-                    ESP_LOGI(TAG, "Sent MessagePack greeting response");
-                }
-                else {
-                    ESP_LOGE(TAG, "Failed to send WebSocket message");
-                }
-            }
-            else {
-                ESP_LOGE(TAG, "Failed to serialize MessagePack");
-                mpack_error_t err = mpack_writer_error(&writer);
-                ESP_LOGE(TAG, "MPack writer error: %d", err);
-            }
+            sendWebSockMessage(doc);
         }
         break;
     }
@@ -284,16 +377,26 @@ void app_main(void) {
     esp_websocket_client_start(client);
 
     while (1) {
-        // O evento de dados é tratado na callback, aqui só mantemos a task viva
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        //     // O evento de dados é tratado na callback, aqui só mantemos a task viva
+        vTaskDelay(30000 / portTICK_PERIOD_MS);
 
-        free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-        min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
-        largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+        JsonDocument doc;
+        doc["type"] = "pub";
 
-        ESP_LOGI(TAG, "Free heap: %u bytes", (unsigned)free_heap);
-        ESP_LOGI(TAG, "Minimum ever free heap: %u bytes", (unsigned)min_free_heap);
-        ESP_LOGI(TAG, "Largest free block: %u bytes", (unsigned)largest_free_block);
+        doc["content"].to<JsonObject>();
+        doc["content"]["numero"] = 0;
+        doc["content"]["hw"] = "OLA MUNDO";
+        doc["content"]["bool"] = true;
+
+        sendWebSockMessage(doc);
+
+        //     free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+        //     min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+        //     largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+
+        //     ESP_LOGI(TAG, "Free heap: %u bytes", (unsigned)free_heap);
+        //     ESP_LOGI(TAG, "Minimum ever free heap: %u bytes", (unsigned)min_free_heap);
+        //     ESP_LOGI(TAG, "Largest free block: %u bytes", (unsigned)largest_free_block);
     }
 
     // Nunca alcançado, mas caso queira parar e limpar:
