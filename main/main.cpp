@@ -23,13 +23,13 @@ extern "C" {
 void app_main(void);
 }
 
-void serializeJsonToMpack(mpack_writer_t *writer, JsonVariant variant) {
+void jsonToMpack(mpack_writer_t *writer, JsonVariant variant) {
     if (variant.is<JsonObject>()) {
         JsonObject obj = variant.as<JsonObject>();
         mpack_start_map(writer, obj.size());
         for (JsonPair kv : obj) {
             mpack_write_cstr(writer, kv.key().c_str());
-            serializeJsonToMpack(writer, kv.value());
+            jsonToMpack(writer, kv.value());
         }
         mpack_finish_map(writer);
     }
@@ -37,7 +37,7 @@ void serializeJsonToMpack(mpack_writer_t *writer, JsonVariant variant) {
         JsonArray arr = variant.as<JsonArray>();
         mpack_start_array(writer, arr.size());
         for (JsonVariant v : arr) {
-            serializeJsonToMpack(writer, v);
+            jsonToMpack(writer, v);
         }
         mpack_finish_array(writer);
     }
@@ -65,7 +65,7 @@ void serializeJsonToMpack(mpack_writer_t *writer, JsonVariant variant) {
     }
 }
 
-void deserializeMpackToJsonInternal(mpack_node_t node, JsonVariant variant) {
+void mpackToJsonInternal(mpack_node_t node, JsonVariant variant) {
     switch (mpack_node_type(node)) {
     case mpack_type_nil:
         variant.set(nullptr);
@@ -100,7 +100,7 @@ void deserializeMpackToJsonInternal(mpack_node_t node, JsonVariant variant) {
         size_t count = mpack_node_array_length(node);
         for (size_t i = 0; i < count; ++i) {
             JsonVariant element = arr.add<JsonVariant>();
-            deserializeMpackToJsonInternal(mpack_node_array_at(node, i), element);
+            mpackToJsonInternal(mpack_node_array_at(node, i), element);
         }
         break;
     }
@@ -119,7 +119,7 @@ void deserializeMpackToJsonInternal(mpack_node_t node, JsonVariant variant) {
             obj[keyBuf].to<JsonVariant>();
             JsonVariant child = obj[keyBuf];
             delete[] keyBuf;
-            deserializeMpackToJsonInternal(valNode, child);
+            mpackToJsonInternal(valNode, child);
         }
         break;
     }
@@ -129,31 +129,31 @@ void deserializeMpackToJsonInternal(mpack_node_t node, JsonVariant variant) {
     }
 }
 
-JsonDocument deserializeMpackToJson(mpack_node_t root) {
+JsonDocument mpackToJson(mpack_node_t root) {
     JsonDocument doc;
 
     JsonVariant variant = doc.to<JsonVariant>();
 
-    deserializeMpackToJsonInternal(root, variant);
+    mpackToJsonInternal(root, variant);
 
     return doc; // Returna o JsonDocument.
 }
 
-void sendWebSockMessage(JsonDocument doc) {
+void sendWSMessage(JsonDocument doc) {
     uint16_t strSize = measureJson(doc); // Pega o tamanho do JSON em string para garantir que vai caber no buffer do MessagePack
     // uint8_t msgpackBuf[256] __attribute__((aligned(4)));
     uint8_t *msgpackBuf = new uint8_t[strSize];
     mpack_writer_t writer;
     mpack_writer_init(&writer, (char *)msgpackBuf, strSize);
 
-    serializeJsonToMpack(&writer, doc.as<JsonVariant>());
+    jsonToMpack(&writer, doc.as<JsonVariant>());
 
     size_t used = mpack_writer_buffer_used(&writer);
 
     if (!mpack_writer_destroy(&writer)) {
         int err = esp_websocket_client_send_bin(client, (const char *)msgpackBuf, used, portMAX_DELAY);
         if (err > 0) {
-            ESP_LOGI(TAG, "Sent MessagePack response");
+            // ESP_LOGI(TAG, "Sent MessagePack response");
         }
         else {
             ESP_LOGE(TAG, "Failed to send WebSocket message");
@@ -170,17 +170,17 @@ void sendWebSockMessage(JsonDocument doc) {
 
 /**
  * @brief Calcula a contrachave (resposta HMAC-SHA256).
- * * @param desafio A string de desafio recebida do servidor.
- * @param segredo O segredo compartilhado do dispositivo.
- * @param saida_buffer O buffer onde a resposta hexadecimal será escrita.
- * @param saida_buffer_len O tamanho do buffer de saída.
+ * @param challenge A string de challenge recebida do servidor.
+ * @param secret O secret compartilhado do dispositivo.
+ * @param outputBuffer O buffer onde a resposta hexadecimal será escrita.
+ * @param outputBufferLen O tamanho do buffer de saída.
  * @return esp_err_t ESP_OK em sucesso, ESP_FAIL em erro.
  */
-esp_err_t calculate_key(const char *desafio, const char *segredo, char *saida_buffer, size_t saida_buffer_len) {
+esp_err_t calculateKey(const char *challenge, const char *secret, char *outputBuffer, size_t outputBufferLen) {
 
     // O hash SHA-256 tem 32 bytes de saída binária.
     // Em hexadecimal, são 64 caracteres + 1 para o terminador nulo.
-    if (saida_buffer_len < 65) {
+    if (outputBufferLen < 65) {
         ESP_LOGE(TAG, "Buffer de saída muito pequeno!");
         return ESP_FAIL;
     }
@@ -199,21 +199,21 @@ esp_err_t calculate_key(const char *desafio, const char *segredo, char *saida_bu
         return ESP_FAIL;
     }
 
-    // 2. Configura o contexto para o modo HMAC com o segredo
+    // 2. Configura o contexto para o modo HMAC com o secret
     if (mbedtls_md_setup(&ctx, md_info, 1) != 0) { // 1 = hmac mode
         ESP_LOGE(TAG, "Falha no mbedtls_md_setup");
         mbedtls_md_free(&ctx);
         return ESP_FAIL;
     }
 
-    if (mbedtls_md_hmac_starts(&ctx, (const unsigned char *)segredo, strlen(segredo)) != 0) {
+    if (mbedtls_md_hmac_starts(&ctx, (const unsigned char *)secret, strlen(secret)) != 0) {
         ESP_LOGE(TAG, "Falha no mbedtls_md_hmac_starts");
         mbedtls_md_free(&ctx);
         return ESP_FAIL;
     }
 
-    // 3. Alimenta o desafio no cálculo do HMAC
-    if (mbedtls_md_hmac_update(&ctx, (const unsigned char *)desafio, strlen(desafio)) != 0) {
+    // 3. Alimenta o challenge no cálculo do HMAC
+    if (mbedtls_md_hmac_update(&ctx, (const unsigned char *)challenge, strlen(challenge)) != 0) {
         ESP_LOGE(TAG, "Falha no mbedtls_md_hmac_update");
         mbedtls_md_free(&ctx);
         return ESP_FAIL;
@@ -231,15 +231,15 @@ esp_err_t calculate_key(const char *desafio, const char *segredo, char *saida_bu
 
     // 5. Converte o resultado binário para uma string hexadecimal
     for (int i = 0; i < sizeof(hmac_resultado); i++) {
-        sprintf(saida_buffer + (i * 2), "%02x", hmac_resultado[i]);
+        sprintf(outputBuffer + (i * 2), "%02x", hmac_resultado[i]);
     }
-    saida_buffer[64] = '\0'; // Adiciona o terminador nulo
+    outputBuffer[64] = '\0'; // Adiciona o terminador nulo
 
     ESP_LOGI(TAG, "Cálculo da contrachave concluído com sucesso.");
     return ESP_OK;
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+static void wifiEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     switch (event_id) {
     case WIFI_EVENT_STA_START:
         esp_wifi_connect();
@@ -256,7 +256,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
-static void wifi_init_sta(void) {
+static void wifiInitSTA(void) {
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
@@ -272,13 +272,13 @@ static void wifi_init_sta(void) {
     };
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifiEventHandler, NULL, NULL);
     esp_wifi_start();
 
     ESP_LOGI(TAG, "WiFi initialization done.");
 }
 
-static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+static void websocketEventHandler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
 
     switch (event_id) {
@@ -301,9 +301,9 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         mpack_tree_parse(&tree);
         mpack_node_t root = mpack_tree_root(&tree);
 
-        rcvData = deserializeMpackToJson(root);
+        rcvData = mpackToJson(root);
         mpack_tree_destroy(&tree);
-        ESP_LOGI(TAG, "Received data: %s", rcvData.as<std::string>().c_str());
+        // ESP_LOGI(TAG, "Received data: %s", rcvData.as<std::string>().c_str());
 
         if (rcvData["type"].as<std::string>() == "greeting") {
             ESP_LOGI(TAG, "Greeting detected, preparing JSON...");
@@ -317,10 +317,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             doc["content"]["kind"] = 0;
 
             char calcKey[65]; // 64 chars para hex + 1 para '\0'
-            calculate_key(rcvData["content"][1].as<const char *>(), "100015-ChaveSecreta", calcKey, sizeof(calcKey));
+            calculateKey(rcvData["content"][1].as<const char *>(), "100015-ChaveSecreta", calcKey, sizeof(calcKey));
             doc["content"]["key"] = std::string(calcKey);
 
-            sendWebSockMessage(doc);
+            sendWSMessage(doc);
         }
         else if (rcvData["type"].as<std::string>() == "greeting-reply") {
             JsonDocument doc;
@@ -328,7 +328,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
             doc["content"].to<JsonObject>();
 
-            sendWebSockMessage(doc);
+            sendWSMessage(doc);
         }
         break;
     }
@@ -352,13 +352,14 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    wifi_init_sta();
+    wifiInitSTA();
 
     ESP_LOGI(TAG, "Connecting to WiFi...");
     vTaskDelay(5000 / portTICK_PERIOD_MS);
 
     esp_websocket_client_config_t websocket_cfg = {
         .uri = "wss://brise2-debug.agst.com.br/ws",
+        .user_agent = "Brise 2",
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
@@ -366,13 +367,14 @@ void app_main(void) {
     size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
     size_t largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
 
-    ESP_LOGI(TAG, "Free heap: %u bytes", (unsigned)free_heap);
-    ESP_LOGI(TAG, "Minimum ever free heap: %u bytes", (unsigned)min_free_heap);
-    ESP_LOGI(TAG, "Largest free block: %u bytes", (unsigned)largest_free_block);
+    ESP_LOGW(TAG, "-=MEMORIA ANTES WS=-");
+    ESP_LOGI(TAG, "Heap Livre: %u bytes", (unsigned)free_heap);
+    ESP_LOGI(TAG, "Minimo de heap: %u bytes", (unsigned)min_free_heap);
+    ESP_LOGI(TAG, "Maior bloco livre: %u bytes", (unsigned)largest_free_block);
 
     client = esp_websocket_client_init(&websocket_cfg);
 
-    esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
+    esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocketEventHandler, NULL);
 
     esp_websocket_client_start(client);
 
@@ -384,19 +386,18 @@ void app_main(void) {
         doc["type"] = "pub";
 
         doc["content"].to<JsonObject>();
-        doc["content"]["numero"] = 0;
-        doc["content"]["hw"] = "OLA MUNDO";
-        doc["content"]["bool"] = true;
+        doc["content"]["hw"] = "Tiaguin lambe pintin";
 
-        sendWebSockMessage(doc);
+        sendWSMessage(doc);
 
-        //     free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-        //     min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
-        //     largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+        free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+        min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+        largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
 
-        //     ESP_LOGI(TAG, "Free heap: %u bytes", (unsigned)free_heap);
-        //     ESP_LOGI(TAG, "Minimum ever free heap: %u bytes", (unsigned)min_free_heap);
-        //     ESP_LOGI(TAG, "Largest free block: %u bytes", (unsigned)largest_free_block);
+        ESP_LOGW(TAG, "-=MEMORIA RODANDO WS=-");
+        ESP_LOGI(TAG, "Heap Livre: %u bytes", (unsigned)free_heap);
+        ESP_LOGI(TAG, "Minimo de heap: %u bytes", (unsigned)min_free_heap);
+        ESP_LOGI(TAG, "Maior bloco livre: %u bytes", (unsigned)largest_free_block);
     }
 
     // Nunca alcançado, mas caso queira parar e limpar:
